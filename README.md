@@ -6,7 +6,7 @@ This project is a high-fidelity implementation of the **DLBMT** algorithm using 
 
 The original project (main) was a **Python-based mathematical simulation**. It calculated load and migrations based on formulas without any real network traffic or control plane interaction.
 
-| Feature | Original ZIP (`sdn_simulator.py`) | This Project (`dlbmt/`) |
+| Feature | Main (`sdn_simulator.py`) | Master |
 |---------|-----------------------------------|-------------------------|
 | **Core** | Static Python script | **Mininet** (Network Emulator) + **Ryu** (SDN Controller) |
 | **Traffic** | Simulated using random numbers | **Real Packets** (ICMP/Ping, TCP/UDP via `iperf`) |
