@@ -1,362 +1,347 @@
 """
-DLBMT Dashboard – Flask REST API + WebSocket Backend
-Provides real-time network monitoring, topology data, and automatic migration control.
+DLBMT Dashboard — Flask + SocketIO Backend
+============================================
+Receives real-time metrics from Ryu controllers, runs DLBMT load
+balancing, and serves REST + WebSocket API for the React frontend.
 """
 
 import os
 import time
-import json
 import logging
 import threading
-from flask import Flask, jsonify, request, send_from_directory
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO
 
-from dlbmt_engine import DLBMTEngine, ControllerLevel
-from sdn_simulator import SDNSimulator, TOPOLOGIES
-from traffic_generator import TrafficGenerator
+from real_dlbmt_engine import RealDLBMTEngine
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+# =====================================================================
+#  Flask setup
+# =====================================================================
 
-# ---------------------------------------------------------------------------
-# App Setup – serve React build from frontend/dist
-# ---------------------------------------------------------------------------
-DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
-app = Flask(__name__, static_folder=DIST_DIR, static_url_path="")
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+app = Flask(__name__)
+CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-# ---------------------------------------------------------------------------
-# Global State
-# ---------------------------------------------------------------------------
-simulator: SDNSimulator = None
-traffic_gen: TrafficGenerator = None
-auto_migration_enabled = True
-simulation_speed = 1.0   # ticks per second
-simulation_running = True
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("dlbmt.app")
+
+# =====================================================================
+#  Engine & state
+# =====================================================================
+
+# Controls
+TOPO_NAME = os.environ.get("DLBMT_TOPO", "atlanta")
+engine = RealDLBMTEngine(topology_name=TOPO_NAME)
 sim_lock = threading.Lock()
 
+# Controls
+auto_migration_enabled = True
+polling_interval = 1.0  # seconds
 
-def init_simulation(topology_name: str = "atlanta"):
-    """Initialize or reset the simulation."""
-    global simulator, traffic_gen
+# =====================================================================
+#  Ryu update endpoint — receives metrics from each Ryu controller
+# =====================================================================
+
+@app.route("/api/ryu/update", methods=["POST"])
+def ryu_update():
+    """
+    Called by each Ryu controller instance every second.
+    Payload: {controller_id, cpu, memory, switches: {dpid: pkt_count}}
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "no data"}), 400
+
     with sim_lock:
-        simulator = SDNSimulator(topology_name)
-        traffic_gen = TrafficGenerator(simulator.engine)
-        traffic_gen.set_pattern("wave", 1.0)
-        # Initial traffic tick to populate data
-        traffic_gen.generate_tick()
-        simulator.engine.update_controller_levels()
-    logger.info(f"Simulation initialized with topology: {topology_name}")
+        engine.update_controller_metrics(data)
+
+    return jsonify({"ok": True})
 
 
-# ---------------------------------------------------------------------------
-# Background Simulation Loop
-# ---------------------------------------------------------------------------
+# =====================================================================
+#  REST API — Topology
+# =====================================================================
 
-def simulation_loop():
-    """Background thread that runs the simulation."""
-    global simulation_running
-
-    while simulation_running:
-        try:
-            interval = 1.0 / simulation_speed if simulation_speed > 0 else 1.0
-            time.sleep(interval)
-
-            with sim_lock:
-                if simulator is None:
-                    continue
-
-                # Generate traffic
-                traffic_gen.generate_tick()
-
-                # Update controller levels
-                level_changes = simulator.engine.update_controller_levels()
-
-                # Run automatic migration if enabled
-                migration_record = None
-                if auto_migration_enabled:
-                    migration_record = simulator.engine.run_load_balancing()
-
-                # Take snapshot for time-series
-                snapshot = simulator.engine.take_snapshot()
-
-                # Emit real-time updates via WebSocket
-                try:
-                    socketio.emit("state_update", {
-                        "snapshot": snapshot,
-                        "traffic": traffic_gen.get_traffic_summary(),
-                        "migration": migration_record.to_dict() if migration_record else None,
-                        "level_changes": {k: v for k, v in level_changes.items() if v},
-                    })
-                except Exception:
-                    pass
-
-        except Exception as e:
-            logger.error(f"Simulation loop error: {e}")
-            time.sleep(1)
-
-
-# ---------------------------------------------------------------------------
-# REST API Routes
-# ---------------------------------------------------------------------------
-
-@app.route("/api/topology", methods=["GET"])
+@app.route("/api/topology")
 def get_topology():
-    """Get complete topology data for visualization."""
+    """Return topology data for the frontend TopologyView component."""
     with sim_lock:
-        if simulator is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-        data = simulator.get_topology_data()
+        snapshot = engine.take_snapshot()
+
+    nodes = []
+    links = []
+
+    # Controllers
+    for cid, ctrl in engine.controllers.items():
+        cdata = snapshot["controllers"].get(cid, {})
+        nodes.append({
+            "id": cid,
+            "type": "controller",
+            "x": ctrl.x,
+            "y": ctrl.y,
+            "load": cdata.get("load", 0),
+            "level": cdata.get("level", 1),
+            "level_label": cdata.get("level_label", "Idle"),
+            "level_color": cdata.get("level_color", "#00ff88"),
+            "switch_count": cdata.get("switch_count", 0),
+            "capacity_cpu": ctrl.capacity_cpu,
+            "capacity_mem": ctrl.capacity_mem,
+            "capacity_bw": ctrl.capacity_bw,
+        })
+
+    # Switches
+    mapping = engine.build_mapping()
+    for cid, sw_ids in mapping.items():
+        for sid in sw_ids:
+            sw = engine.switches.get(sid)
+            if not sw:
+                continue
+            nodes.append({
+                "id": sid,
+                "type": "switch",
+                "controller_id": cid,
+                "x": sw.x,
+                "y": sw.y,
+                "packet_in_rate": round(sw.packet_in_rate, 1),
+                "load_cpu": round(sw.load_cpu, 2),
+                "load_mem": round(sw.load_mem, 2),
+                "load_bw": round(sw.load_bw, 4),
+                "resource_usage": round(
+                    engine._switch_resource_usage(sw, engine.controllers[cid]) * 100, 2
+                ),
+            })
+            links.append({
+                "source": cid,
+                "target": sid,
+                "type": "domain",
+            })
+
+    # Infrastructure links (switch-to-switch)
+    for src, tgt in engine.get_infra_links():
+        links.append({
+            "source": src,
+            "target": tgt,
+        })
+
+    return jsonify({
+        "topology_name": getattr(engine, "topology_name", "Unknown"),
+        "nodes": nodes,
+        "links": links,
+    })
+
+
+# =====================================================================
+#  REST API — Controllers
+# =====================================================================
+
+@app.route("/api/controllers")
+def get_controllers():
+    """Return controller data for the ControllerPanel component."""
+    with sim_lock:
+        result = []
+        mapping = engine.build_mapping()
+
+        for cid, ctrl in engine.controllers.items():
+            result.append({
+                "id": cid,
+                "load_percentage": round(ctrl.load_percentage, 2),
+                "level": ctrl.level.value,
+                "level_label": ctrl.level.label,
+                "level_color": ctrl.level.color,
+                "switch_count": len(mapping.get(cid, [])),
+                "cpu_utilization": round(ctrl.cpu_utilization, 2),
+                "mem_utilization": round(ctrl.mem_utilization, 2),
+                "bw_utilization": round(ctrl.bw_utilization, 2),
+                "capacity_cpu": ctrl.capacity_cpu,
+                "capacity_mem": ctrl.capacity_mem,
+                "capacity_bw": ctrl.capacity_bw,
+                "active": ctrl.active,
+            })
+
+    return jsonify(result)
+
+
+# =====================================================================
+#  REST API — Statistics
+# =====================================================================
+
+@app.route("/api/stats/summary")
+def get_stats_summary():
+    """Return aggregate stats for the top stat cards."""
+    with sim_lock:
+        mapping = engine.build_mapping()
+        loads = [c.load_percentage for c in engine.controllers.values() if c.active]
+        avg_load = round(sum(loads) / len(loads), 2) if loads else 0.0
+
+    return jsonify({
+        "total_controllers": len(engine.controllers),
+        "total_switches": len(engine.switches),
+        "avg_load": avg_load,
+        "total_migrations": len(engine.migration_history),
+        "global_imbalance": round(engine._global_imbalance(), 4),
+        "domain_sizes": {cid: len(sws) for cid, sws in mapping.items()},
+    })
+
+
+@app.route("/api/stats/timeseries")
+def get_timeseries():
+    """Return time-series data for the LoadChart component."""
+    limit = request.args.get("limit", 60, type=int)
+    with sim_lock:
+        data = engine.timeseries[-limit:]
     return jsonify(data)
 
 
-@app.route("/api/controllers", methods=["GET"])
-def get_controllers():
-    """Get all controller statuses."""
-    with sim_lock:
-        if simulator is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-        controllers = []
-        for ctrl_id, ctrl in simulator.engine.controllers.items():
-            info = ctrl.to_dict()
-            info["switch_count"] = len(simulator.engine.get_switches_in_domain(ctrl_id))
-            # Add per-resource totals
-            switches = simulator.engine.get_switches_in_domain(ctrl_id)
-            info["total_cpu_used"] = round(sum(s.load_cpu for s in switches), 2)
-            info["total_mem_used"] = round(sum(s.load_mem for s in switches), 2)
-            info["total_bw_used"] = round(sum(s.load_bw for s in switches), 2)
-            info["cpu_utilization"] = round(info["total_cpu_used"] / ctrl.capacity_cpu * 100, 2) if ctrl.capacity_cpu > 0 else 0
-            info["mem_utilization"] = round(info["total_mem_used"] / ctrl.capacity_mem * 100, 2) if ctrl.capacity_mem > 0 else 0
-            info["bw_utilization"] = round(info["total_bw_used"] / ctrl.capacity_bw * 100, 2) if ctrl.capacity_bw > 0 else 0
-            controllers.append(info)
-    return jsonify(controllers)
+# =====================================================================
+#  REST API — Migrations
+# =====================================================================
 
-
-@app.route("/api/switches", methods=["GET"])
-def get_switches():
-    """Get all switch details."""
-    with sim_lock:
-        if simulator is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-        switches = []
-        for sw_id, sw in simulator.engine.switches.items():
-            ctrl = simulator.engine.controllers.get(sw.controller_id)
-            usage = simulator.engine.compute_switch_resource_usage(sw, ctrl) if ctrl else 0
-            info = sw.to_dict()
-            info["resource_usage"] = round(usage * 100, 2)
-            info["distance_to_controller"] = simulator.engine.get_distance(sw_id, sw.controller_id)
-            switches.append(info)
-    return jsonify(switches)
-
-
-@app.route("/api/migration/history", methods=["GET"])
+@app.route("/api/migration/history")
 def get_migration_history():
-    """Get migration history log."""
+    """Return migration log entries."""
+    limit = request.args.get("limit", 50, type=int)
     with sim_lock:
-        if simulator is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-        limit = request.args.get("limit", 50, type=int)
-        history = [r.to_dict() for r in simulator.engine.migration_history[-limit:]]
-    return jsonify(history)
-
-
-@app.route("/api/migration/trigger", methods=["POST"])
-def trigger_migration():
-    """Manually trigger one round of DLBMT load balancing."""
-    with sim_lock:
-        if simulator is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-
-        # Update levels first
-        simulator.engine.update_controller_levels()
-        record = simulator.engine.run_load_balancing()
-
-        if record:
-            return jsonify({"success": True, "migration": record.to_dict()})
-        else:
-            return jsonify({"success": False, "message": "No migration needed or possible"})
+        data = engine.migration_history[-limit:]
+    return jsonify(data)
 
 
 @app.route("/api/migration/auto", methods=["POST"])
 def toggle_auto_migration():
     """Toggle automatic migration on/off."""
     global auto_migration_enabled
-    data = request.get_json() or {}
-    if "enabled" in data:
-        auto_migration_enabled = bool(data["enabled"])
+    body = request.get_json(silent=True) or {}
+
+    if "enabled" in body:
+        auto_migration_enabled = bool(body["enabled"])
     else:
         auto_migration_enabled = not auto_migration_enabled
 
+    logger.info("Auto-migration: %s", auto_migration_enabled)
     return jsonify({"auto_migration_enabled": auto_migration_enabled})
 
 
-@app.route("/api/stats/timeseries", methods=["GET"])
-def get_timeseries():
-    """Get time-series load history for charts."""
-    with sim_lock:
-        if simulator is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-        limit = request.args.get("limit", 60, type=int)
-        history = simulator.engine.load_history[-limit:]
-    return jsonify(history)
-
-
-@app.route("/api/stats/summary", methods=["GET"])
-def get_stats_summary():
-    """Get current stats summary."""
-    with sim_lock:
-        if simulator is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-        stats = simulator.engine.get_stats()
-        stats["traffic"] = traffic_gen.get_traffic_summary()
-        stats["auto_migration"] = auto_migration_enabled
-        stats["simulation_speed"] = simulation_speed
-    return jsonify(stats)
-
-
-@app.route("/api/stats/comparison", methods=["GET"])
-def get_comparison_stats():
-    """Get comparison data matching paper metrics (Tables 4-7)."""
-    with sim_lock:
-        if simulator is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-
-        stats = simulator.engine.get_stats()
-        history = simulator.engine.migration_history
-
-        # Calculate average migration cost
-        avg_cost = sum(r.migration_cost for r in history) / len(history) if history else 0
-
-        # Calculate average imbalance improvement
-        imbalance_improvements = []
-        for r in history:
-            if r.imbalance_before > 0:
-                improvement = (r.imbalance_before - r.imbalance_after) / r.imbalance_before * 100
-                imbalance_improvements.append(improvement)
-        avg_improvement = sum(imbalance_improvements) / len(imbalance_improvements) if imbalance_improvements else 0
-
-        return jsonify({
-            "current_topology": simulator.topo_config["name"],
-            "avg_load": stats["avg_load"],
-            "global_imbalance": stats["global_imbalance"],
-            "total_migrations": len(history),
-            "avg_migration_cost": round(avg_cost, 4),
-            "avg_imbalance_improvement": round(avg_improvement, 2),
-            "controller_loads": stats["controller_loads"],
-            "controller_levels": stats["controller_levels"],
-            "domain_sizes": stats["domain_sizes"],
-        })
-
-
-@app.route("/api/config/topology", methods=["POST"])
-def change_topology():
-    """Change the network topology."""
-    data = request.get_json() or {}
-    topology = data.get("topology", "atlanta")
-    if topology not in TOPOLOGIES:
-        return jsonify({"error": f"Unknown topology. Choose from: {list(TOPOLOGIES.keys())}"}), 400
-
-    init_simulation(topology)
-    return jsonify({"success": True, "topology": topology})
-
-
-@app.route("/api/config/topologies", methods=["GET"])
-def list_topologies():
-    """List available topologies."""
-    topos = {}
-    for key, val in TOPOLOGIES.items():
-        topos[key] = {
-            "name": val["name"],
-            "nodes": val["nodes"],
-            "edges": val["edges"],
-            "controllers": val["controllers"],
-        }
-    return jsonify(topos)
-
+# =====================================================================
+#  REST API — Configuration
+# =====================================================================
 
 @app.route("/api/config/traffic", methods=["POST"])
-def configure_traffic():
-    """Change traffic pattern and intensity."""
-    data = request.get_json() or {}
-    pattern = data.get("pattern", "wave")
-    intensity = data.get("intensity", 1.0)
-
-    with sim_lock:
-        if traffic_gen is None:
-            return jsonify({"error": "Simulation not initialized"}), 500
-        try:
-            traffic_gen.set_pattern(pattern, intensity)
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 400
-
-    return jsonify({"pattern": pattern, "intensity": intensity})
+def config_traffic():
+    """
+    In the real Ryu+Mininet setup, traffic is generated from the Mininet CLI.
+    This endpoint just returns guidance commands.
+    """
+    return jsonify({
+        "mode": "mininet_cli",
+        "message": "Traffic is generated from the Mininet CLI, not the dashboard.",
+        "commands": {
+            "light": "h1 ping h4 -i 0.5 &",
+            "medium": "h1 ping h4 -i 0.1 & h2 ping h5 -i 0.1 &",
+            "heavy": "h1 ping -f h2 & h2 ping -f h3 & h3 ping -f h1 &",
+            "iperf": "h1 iperf -s & h4 iperf -c 10.0.0.1 -t 30 &",
+            "stop_all": "sh killall ping iperf 2>/dev/null",
+        },
+    })
 
 
 @app.route("/api/config/speed", methods=["POST"])
-def configure_speed():
-    """Change simulation speed."""
-    global simulation_speed
-    data = request.get_json() or {}
-    speed = data.get("speed", 1.0)
-    simulation_speed = max(0.1, min(speed, 10.0))
-    return jsonify({"speed": simulation_speed})
+def config_speed():
+    """Adjust the polling/migration check interval."""
+    global polling_interval
+    body = request.get_json(silent=True) or {}
+    speed = float(body.get("speed", 1.0))
+
+    if speed > 0:
+        polling_interval = 1.0 / speed
+        logger.info("Polling interval set to %.2fs (speed=%.1fx)", polling_interval, speed)
+
+    return jsonify({"speed": speed, "interval": polling_interval})
 
 
-# ---------------------------------------------------------------------------
-# WebSocket Events
-# ---------------------------------------------------------------------------
+@app.route("/api/config/topology", methods=["POST"])
+def config_topology():
+    """
+    Topology is fixed in Mininet. This endpoint is a no-op
+    but prevents frontend errors if the old dropdown is used.
+    """
+    return jsonify({
+        "message": "Topology is fixed at Mininet startup. "
+                   "Restart topo_multi.py with a different script to change topology.",
+    })
+
+
+# =====================================================================
+#  WebSocket events
+# =====================================================================
 
 @socketio.on("connect")
 def handle_connect():
-    logger.info("Client connected via WebSocket")
-    with sim_lock:
-        if simulator:
-            emit("topology", simulator.get_topology_data())
-            emit("state_update", {
-                "snapshot": simulator.engine.take_snapshot(),
-                "traffic": traffic_gen.get_traffic_summary(),
-                "migration": None,
-                "level_changes": {},
-            })
+    logger.info("Client connected: %s", request.sid)
+    # Send initial topology
+    socketio.emit("topology", get_topology().get_json(), to=request.sid)
 
 
-@socketio.on("request_topology")
-def handle_request_topology():
-    with sim_lock:
-        if simulator:
-            emit("topology", simulator.get_topology_data())
+@socketio.on("disconnect")
+def handle_disconnect():
+    logger.info("Client disconnected: %s", request.sid)
 
 
-# ---------------------------------------------------------------------------
-# SPA Serving
-# ---------------------------------------------------------------------------
+# =====================================================================
+#  Background loop — snapshot + load balancing
+# =====================================================================
 
-@app.route("/")
-def serve_index():
-    return send_from_directory(DIST_DIR, "index.html")
+def simulation_loop():
+    """
+    Background thread that periodically:
+    1. Takes a snapshot of current state
+    2. Runs load balancing if auto_migration is enabled
+    3. Emits updates to all connected WebSocket clients
+    """
+    while True:
+        time.sleep(polling_interval)
 
-@app.errorhandler(404)
-def fallback(e):
-    """Serve index.html for SPA client-side routing."""
-    return send_from_directory(DIST_DIR, "index.html")
+        with sim_lock:
+            snapshot = engine.take_snapshot()
+            migration_record = None
+
+            if auto_migration_enabled:
+                migration_record = engine.run_load_balancing()
+
+        socketio.emit("state_update", {
+            "snapshot": snapshot,
+            "traffic": {},
+            "migration": migration_record,
+            "level_changes": {},
+        })
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# =====================================================================
+#  Startup
+# =====================================================================
 
 if __name__ == "__main__":
-    # Initialize simulation
-    init_simulation("atlanta")
+    logger.info("=" * 60)
+    logger.info("DLBMT Dashboard Backend — Ryu + Mininet Mode")
+    logger.info("=" * 60)
+    logger.info("Waiting for Ryu controllers to POST to /api/ryu/update")
+    logger.info("")
+    logger.info("Setup sequence:")
+    logger.info("  1. bash run_ryu.sh          (start 3 Ryu controllers)")
+    logger.info("  2. sudo python topo_multi.py (start Mininet)")
+    logger.info("  3. python app.py             (this server)")
+    logger.info("  4. cd frontend && npm run dev (dashboard)")
+    logger.info("")
+    logger.info("Generate traffic from Mininet CLI:")
+    logger.info("  mininet> h1 ping h4 -i 0.1 &")
+    logger.info("  mininet> h1 ping -f h2 &  (flood for overload)")
+    logger.info("=" * 60)
 
-    # Start background simulation thread
-    sim_thread = threading.Thread(target=simulation_loop, daemon=True)
-    sim_thread.start()
+    # Start background loop
+    bg_thread = threading.Thread(target=simulation_loop, daemon=True)
+    bg_thread.start()
 
-    logger.info("Starting DLBMT Dashboard Backend on port 5000...")
     socketio.run(app, host="0.0.0.0", port=5000, debug=False, allow_unsafe_werkzeug=True)

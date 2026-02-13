@@ -130,7 +130,7 @@ export default function App() {
                     <span className={`status-dot ${connected ? 'connected' : 'disconnected'}`}
                         title={connected ? 'Connected' : 'Disconnected'}></span>
                 </div>
-                <div className="header-controls">
+                {/* <div className="header-controls">
                     <select className="btn" value={selectedTopology}
                         onChange={e => changeTopology(e.target.value)}>
                         <option value="atlanta">Atlanta (15 nodes)</option>
@@ -165,7 +165,7 @@ export default function App() {
                         <option value="5">⏱ 5x</option>
                     </select>
 
-                </div>
+                </div> */}
             </header>
 
             {/* ===== Main ===== */}

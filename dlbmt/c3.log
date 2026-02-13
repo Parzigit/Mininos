@@ -1,0 +1,23 @@
+loading app ryu_dlbmt_app.py
+loading app ryu.controller.ofp_handler
+instantiating app ryu_dlbmt_app.py of DLBMTRyuApp
+DLBMT Ryu app started — controller_id=c3
+instantiating app ryu.controller.ofp_handler of OFPHandler
+Switch 3 connected to c3
+Switch 5 connected to c3
+Switch 6 connected to c3
+Switch 7 connected to c3
+Switch 17 connected to c3
+Switch 18 connected to c3
+Switch 19 connected to c3
+Switch 21 connected to c3
+Switch 24 connected to c3
+Switch 25 connected to c3
+Switch 32 connected to c3
+Switch 35 connected to c3
+Switch 37 connected to c3
+Switch 39 connected to c3
+Switch 41 connected to c3
+Switch 2 connected to c3
+Switch 8 connected to c3
+Switch 2 connected to c3

@@ -263,16 +263,16 @@ body {
 .topology-panel {
   grid-column: 1;
   grid-row: 2;
-  min-height: 0;
+  height: 650px;
   display: flex;
   flex-direction: column;
 }
 
 .topology-svg {
   flex: 1;
-  min-height: 0;
-  height: 350px;
-  max-height: 350px;
+  /* min-height: 0; */
+  /* height: 350px; */
+  min-height: 50px;
 }
 
 .topology-svg svg {
