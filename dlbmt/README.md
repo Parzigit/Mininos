@@ -4,7 +4,7 @@ This project is a high-fidelity implementation of the **DLBMT** algorithm using 
 
 ## How it Differs from the Original ZIP
 
-The original project (in the ZIP) was a **Python-based mathematical simulation**. It calculated load and migrations based on formulas without any real network traffic or control plane interaction.
+The original project (main) was a **Python-based mathematical simulation**. It calculated load and migrations based on formulas without any real network traffic or control plane interaction.
 
 | Feature | Original ZIP (`sdn_simulator.py`) | This Project (`dlbmt/`) |
 |---------|-----------------------------------|-------------------------|
