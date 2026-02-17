@@ -48,7 +48,11 @@ export default function App() {
 
     // WebSocket connection
     useEffect(() => {
-        const socket = io(window.location.origin, { transports: ['websocket', 'polling'] })
+        const socket = io(import.meta.env.VITE_API_BASE, {
+          transports: ['websocket'],
+          secure: true,
+        })
+
         socketRef.current = socket
 
         socket.on('connect', () => {
