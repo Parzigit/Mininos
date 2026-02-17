@@ -1,1 +1,9 @@
-{\n  "version": 2,\n  "builds": [\n    {\n      "src": "app/**/*.{js,jsx,ts,tsx}",\n      "use": "@vercel/next"\n    }\n  ],\n  "routes": [\n    {\n      "src": "/(.*)",\n      "dest": "app/$1"\n    }\n  ]\n}
+{
+  "framework": "vite",
+  "buildCommand": "cd dlbmt/frontend && npm install && npm run build",
+  "outputDirectory": "dlbmt/frontend/dist",
+  "routes": [
+    { "handle": "filesystem" },
+    { "src": "/.*", "dest": "/index.html" }
+  ]
+}
