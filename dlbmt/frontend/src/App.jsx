@@ -5,7 +5,7 @@ import ControllerPanel from './components/ControllerPanel'
 import LoadChart from './components/LoadChart'
 import MigrationLog from './components/MigrationLog'
 
-const BACKEND = ''  // proxied via vite
+const BACKEND = import.meta.env.VITE_API_BASE  // proxied via vite
 
 export default function App() {
     const [topology, setTopology] = useState(null)
