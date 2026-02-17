@@ -1,0 +1,26 @@
+# DLBMT Application Render Configuration
+
+services:
+  - type: web
+    name: dlbmt-frontend
+    env: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+  - type: web
+    name: dlbmt-backend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
